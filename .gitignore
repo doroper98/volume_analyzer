@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.vscode/
+.idea/
+*.log
+output.txt
+sample_pack.step
