@@ -15,8 +15,8 @@ from PySide6.QtGui import QIcon, QFont, QColor, QPainter, QPixmap, QPen, QBrush
 import pyvista as pv
 from pyvistaqt import QtInteractor
 
-from core.cad_engine import CADEngine
-from core.optimizer import Optimizer
+from core.module_engine import ModuleEngine
+from core.pack_engine import PackEngine
 
 # 스타일 정의 (최상의 밝은 레이아웃)
 STYLE_SHEET = """
@@ -30,6 +30,37 @@ QPushButton:hover { background-color: #DEE2E6; }
 QPushButton#Primary { background-color: #007AFF; color: white; border: none; }
 QPushButton#Primary:hover { background-color: #0056B3; }
 QDoubleSpinBox, QComboBox { background-color: #FFFFFF; border: 1px solid #CED4DA; padding: 5px; border-radius: 5px; }
+QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {
+    width: 20px;
+    height: 12px;
+    background: #F8F9FA;
+    border-left: 1px solid #CED4DA;
+}
+QDoubleSpinBox::up-button {
+    border-top-right-radius: 5px;
+    border-bottom: 0.5px solid #CED4DA;
+}
+QDoubleSpinBox::down-button {
+    border-bottom-right-radius: 5px;
+    border-top: 0.5px solid #CED4DA;
+}
+QDoubleSpinBox::up-button:hover, QDoubleSpinBox::down-button:hover {
+    background: #DEE2E6;
+}
+QDoubleSpinBox::up-arrow {
+    image: url(none); /* Remove default arrow */
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid #495057;
+    width: 0; height: 0;
+}
+QDoubleSpinBox::down-arrow {
+    image: url(none);
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #495057;
+    width: 0; height: 0;
+}
 QScrollArea { border: none; background-color: transparent; }
 """
 
@@ -54,8 +85,8 @@ class EcoPackApp(QMainWindow):
             }
         """
         
-        self.cad = CADEngine()
-        self.opt = Optimizer()
+        self.module_engine = ModuleEngine()
+        self.pack_engine = PackEngine()
         
         # State
         self.pack_info = None
@@ -381,7 +412,17 @@ class EcoPackApp(QMainWindow):
         view_ctrl_layout.addStretch()
         center_layout.addLayout(view_ctrl_layout)
         
-        viewers_split = QHBoxLayout()
+        viewers_splitter = QSplitter(Qt.Horizontal)
+        viewers_splitter.setHandleWidth(12)
+        viewers_splitter.setStyleSheet("""
+            QSplitter::handle:horizontal {
+                background-color: transparent;
+                margin: 0 2px;
+            }
+            QSplitter::handle:horizontal:hover {
+                background-color: rgba(0, 0, 0, 0.03);
+            }
+        """)
         
         # 2. 왼쪽 3D 뷰어 (Module View)
         self.module_viewer_frame = QFrame()
@@ -407,9 +448,26 @@ class EcoPackApp(QMainWindow):
         pv_label.setStyleSheet("font-weight: bold; color: #6C757D;")
         pv_layout.addWidget(pv_label)
         
-        viewers_split.addWidget(self.module_viewer_frame, 1)
-        viewers_split.addWidget(self.pack_viewer_frame, 1)
-        center_layout.addLayout(viewers_split)
+        viewers_splitter.addWidget(self.module_viewer_frame)
+        viewers_splitter.addWidget(self.pack_viewer_frame)
+        viewers_splitter.setSizes([500, 500])  # 초기 비율 50:50
+        
+        # 스플리터 핸들에 그립 바 추가
+        handle = viewers_splitter.handle(1)
+        grip_layout = QVBoxLayout(handle)
+        grip_layout.setContentsMargins(0, 0, 0, 0)
+        grip_bar = QFrame(handle)
+        grip_bar.setFixedSize(4, 40)
+        grip_bar.setStyleSheet("""
+            background-color: #ADB5BD;
+            border-radius: 2px;
+        """)
+        grip_bar.setCursor(Qt.SplitHCursor)
+        grip_layout.addStretch()
+        grip_layout.addWidget(grip_bar, 0, Qt.AlignCenter)
+        grip_layout.addStretch()
+        
+        center_layout.addWidget(viewers_splitter, 1)
         
         # 4. 오른쪽 패널 (Pack Housing & Placement)
         right_panel = QFrame()
@@ -461,11 +519,67 @@ class EcoPackApp(QMainWindow):
         
         # Pack Opt Section
         pack_opt_group = QGroupBox("PACK PLACEMENT")
-        p_opt_layout = QGridLayout(pack_opt_group)
+        p_opt_layout = QVBoxLayout(pack_opt_group)
+        
+        # Row 1: Mod Gap
+        gap_row = QHBoxLayout()
+        gap_row.addWidget(QLabel("Mod Gap"))
         self.mod_clearance = self.create_spinbox(None, "", 10, update_module=False)
         self.mod_clearance.valueChanged.connect(self.update_pack_view)
-        p_opt_layout.addWidget(QLabel("Mod Gap"), 0, 0)
-        p_opt_layout.addWidget(self.mod_clearance, 0, 1)
+        gap_row.addWidget(self.mod_clearance)
+        p_opt_layout.addLayout(gap_row)
+        
+        # Row 2: Rotate Module 90°
+        self.pack_module_rotated = False
+        self.btn_rotate_module = QPushButton("Rotate Module 90°")
+        self.btn_rotate_module.setFixedHeight(35)
+        self.btn_rotate_module.clicked.connect(self.rotate_pack_module)
+        p_opt_layout.addWidget(self.btn_rotate_module)
+        
+        # Row 3: Module Alignment X
+        pack_align_x_label = QLabel("Module Align X")
+        pack_align_x_label.setStyleSheet("font-weight: bold; margin-top: 5px;")
+        p_opt_layout.addWidget(pack_align_x_label)
+        
+        self.pack_align_x_group = QButtonGroup(self)
+        self.pack_align_x_group.setExclusive(True)
+        pack_ax_layout = QHBoxLayout()
+        for label, val in [("Left", "Start"), ("Right", "End"), ("Center", "Center"), ("Even", "Even")]:
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setFixedSize(50, 40)
+            btn.setIcon(self.create_alignment_icon('X', val))
+            btn.setIconSize(QSize(40, 30))
+            btn.setToolTip(label)
+            if val == "Center": btn.setChecked(True)
+            btn.setProperty("align_val", val)
+            btn.clicked.connect(self.optimize_pack)
+            self.pack_align_x_group.addButton(btn)
+            pack_ax_layout.addWidget(btn)
+        p_opt_layout.addLayout(pack_ax_layout)
+        
+        # Row 4: Module Alignment Y
+        pack_align_y_label = QLabel("Module Align Y")
+        pack_align_y_label.setStyleSheet("font-weight: bold; margin-top: 2px;")
+        p_opt_layout.addWidget(pack_align_y_label)
+        
+        self.pack_align_y_group = QButtonGroup(self)
+        self.pack_align_y_group.setExclusive(True)
+        pack_ay_layout = QHBoxLayout()
+        for label, val in [("Top", "End"), ("Bottom", "Start"), ("Middle", "Center"), ("Even", "Even")]:
+            btn = QPushButton()
+            btn.setCheckable(True)
+            btn.setFixedSize(50, 40)
+            btn.setIcon(self.create_alignment_icon('Y', val))
+            btn.setIconSize(QSize(40, 30))
+            btn.setToolTip(label)
+            if val == "Center": btn.setChecked(True)
+            btn.setProperty("align_val", val)
+            btn.clicked.connect(self.optimize_pack)
+            self.pack_align_y_group.addButton(btn)
+            pack_ay_layout.addWidget(btn)
+        p_opt_layout.addLayout(pack_ay_layout)
+        
         r_content_layout.addWidget(pack_opt_group)
         
         # Coordinate Adjustment
@@ -485,6 +599,26 @@ class EcoPackApp(QMainWindow):
         move_grid.addWidget(QLabel("Z"), 1, 0)
         move_grid.addWidget(self.off_z, 1, 1, 1, 3)
         r_content_layout.addWidget(move_group)
+        
+        # New Meshing & Analysis Section
+        mesh_group = QGroupBox("MESHING & ANALYSIS")
+        mesh_layout = QVBoxLayout(mesh_group)
+        
+        self.btn_mesh_analyze = QPushButton("Analysis Inner Volume")
+        self.btn_mesh_analyze.clicked.connect(self.analyze_inner_volume)
+        mesh_layout.addWidget(self.btn_mesh_analyze)
+        
+        self.btn_gen_mesh = QPushButton("Generate Tetra Mesh")
+        self.btn_gen_mesh.clicked.connect(self.generate_tetra_mesh)
+        self.btn_gen_mesh.setEnabled(False)
+        mesh_layout.addWidget(self.btn_gen_mesh)
+        
+        self.mesh_stats_label = QLabel("Nodes: 0 | Elements: 0")
+        self.mesh_stats_label.setStyleSheet("font-size: 11px; color: #007AFF; font-weight: bold;")
+        self.mesh_stats_label.setAlignment(Qt.AlignCenter)
+        mesh_layout.addWidget(self.mesh_stats_label)
+        
+        r_content_layout.addWidget(mesh_group)
         
         r_content_layout.addStretch()
         
@@ -707,7 +841,7 @@ class EcoPackApp(QMainWindow):
             return
             
         for btn, label, pattern_name in self.pattern_widgets:
-            positions = self.opt.pack_cells_in_module(
+            positions = self.module_engine.pack_cells_in_module(
                 self.mod_l.value(), self.mod_w.value(), self.wall_t.value(),
                 cell_type_text, self.cell_l.value(), self.cell_w.value(), self.cell_gap.value(),
                 wall_gap=self.wall_gap.value(),
@@ -871,7 +1005,7 @@ class EcoPackApp(QMainWindow):
             cl = self.cell_l.value()
             cw = self.cell_w.value()
             
-            positions = self.opt.pack_cells_in_module(
+            positions = self.module_engine.pack_cells_in_module(
                 self.mod_l.value(), self.mod_w.value(), self.wall_t.value(),
                 cell_type, cl, cw, self.last_manual_gap,
                 wall_gap=self.wall_gap.value(),
@@ -925,7 +1059,7 @@ class EcoPackApp(QMainWindow):
         l, w, h = self.cell_l.value(), self.cell_w.value(), self.cell_h.value()
         
         # 1. 단일 셀 프리뷰
-        cell_shape = self.cad.create_cell(cell_type, l, w, h)
+        cell_shape = self.module_engine.create_cell(cell_type, l, w, h)
         
         # 2. 모듈 하우징 파라미터 가져오기
         mod_l, mod_w, mod_h = self.mod_l.value(), self.mod_w.value(), self.mod_h.value()
@@ -943,7 +1077,7 @@ class EcoPackApp(QMainWindow):
         
         # 2. 모듈 하우징 프리뷰 (반투명)
         op = self.mod_opacity.value() / 100.0
-        module_housing = self.cad.create_module_housing(mod_l, mod_w, mod_h, wt, bt, tt)
+        module_housing = self.module_engine.create_module_housing(mod_l, mod_w, mod_h, wt, bt, tt)
         self.add_shape_to_viewer(self.module_plotter, module_housing, "#495057", op, line_color="black")
         
         self.finalize_viewer(self.module_plotter)
@@ -967,7 +1101,7 @@ class EcoPackApp(QMainWindow):
         selected_btn = self.pattern_group.checkedButton()
         pattern_name = selected_btn.property("pattern_name") if selected_btn else "Grid (정사각형)"
         
-        cell_positions = self.opt.pack_cells_in_module(
+        cell_positions = self.module_engine.pack_cells_in_module(
             self.mod_l.value(), self.mod_w.value(), self.wall_t.value(),
             cell_type_text, self.cell_l.value(), self.cell_w.value(), self.cell_gap.value(),
             wall_gap=self.wall_gap.value(),
@@ -976,7 +1110,7 @@ class EcoPackApp(QMainWindow):
             align_y=self.align_y_group.checkedButton().property("align_val")
         )
         
-        self.optimized_module_data = self.cad.create_module_assembly(
+        self.optimized_module_data = self.module_engine.create_module_assembly(
             self.mod_l.value(), self.mod_w.value(), self.mod_h.value(),
             self.wall_t.value(), self.bottom_t.value(), self.top_t.value(),
             cell_positions, cell_spec,
@@ -1003,7 +1137,7 @@ class EcoPackApp(QMainWindow):
     def process_loaded_pack(self, file_path):
         """불러온 STEP 파일의 정보를 처리하고 뷰어를 업데이트합니다."""
         self.pack_file_label.setText(os.path.basename(file_path))
-        self.pack_info = self.cad.load_step(file_path)
+        self.pack_info = self.pack_engine.load_step(file_path)
         self.update_pack_view()
 
     def update_pack_view(self):
@@ -1021,16 +1155,15 @@ class EcoPackApp(QMainWindow):
             self.add_shape_to_viewer(self.pack_plotter, self.final_result["cells"], "#28A745", 1.0)
         else:
             # 결과가 없을 때 프리뷰 그림
-            self.add_shape_to_viewer(self.pack_plotter, self.cad.pack_housing, "#ADB5BD", pack_op, line_color="black")
+            self.add_shape_to_viewer(self.pack_plotter, self.pack_engine.pack_housing, "#ADB5BD", pack_op, line_color="black")
             
         # 내부 용적 가이드 항상 표시
         self._draw_inner_cavity()
         self.finalize_viewer(self.pack_plotter)
 
     def _draw_inner_cavity(self):
-        """팩 내부의 가용 공간(Inner Cavity)을 STEP 형상 기반으로 시각화합니다.
-        STEP 형상의 모든 면을 안쪽으로 오프셋하여 실제 내부 공간을 표현합니다.
-        오프셋 연산에 실패하면 단순 직육면체로 폴백합니다.
+        """Optimizer가 사용하는 것과 동일한 직사각형 내부 공간을 시각화합니다.
+        모듈이 배치되는 실제 영역과 정확히 일치하도록 단순 박스로 표현합니다.
         """
         if not self.pack_info: return
         
@@ -1039,26 +1172,16 @@ class EcoPackApp(QMainWindow):
         
         if wt <= 0 and bt <= 0: return
         
-        # 1차 시도: STEP 형상 기반 오프셋 내부 공간
-        inner_cavity = self.cad.create_inner_cavity(
-            wall_thickness=max(wt, 0.1),  # 최소값 보장
-            bottom_thickness=bt if bt != wt else None
-        )
+        import cadquery as cq
+        inner_l = max(1, self.pack_info['l'] - 2 * wt)
+        inner_w = max(1, self.pack_info['w'] - 2 * wt)
+        inner_h = max(1, self.pack_info['h'] - bt)
         
-        if inner_cavity:
-            # 실제 형상 기반 내부 용적 표시
-            self.add_shape_to_viewer(self.pack_plotter, inner_cavity, "#87CEFA", 0.15, line_color="#FF0000")
-        else:
-            # 폴백: 단순 직육면체 박스
-            import cadquery as cq
-            inner_l = max(1, self.pack_info['l'] - 2 * wt)
-            inner_w = max(1, self.pack_info['w'] - 2 * wt)
-            inner_h = max(1, self.pack_info['h'] - bt - 5)
-            
-            inner_box = cq.Workplane("XY").box(inner_l, inner_w, inner_h).translate(
-                (self.pack_info['l'] / 2, self.pack_info['w'] / 2, bt + inner_h / 2)
-            )
-            self.add_shape_to_viewer(self.pack_plotter, inner_box, "#87CEFA", 0.15, line_color="#FF0000")
+        # 팩 벽 안쪽의 직사각형 영역 (Optimizer가 사용하는 것과 동일)
+        inner_box = cq.Workplane("XY").box(inner_l, inner_w, inner_h).translate(
+            (self.pack_info['l'] / 2, self.pack_info['w'] / 2, bt + inner_h / 2)
+        )
+        self.add_shape_to_viewer(self.pack_plotter, inner_box, "#87CEFA", 0.15, line_color="#FF0000")
 
     def optimize_pack(self):
         """Step 2 실행: 팩 내부 모듈 채우기"""
@@ -1072,17 +1195,30 @@ class EcoPackApp(QMainWindow):
         inner_l = max(0, self.pack_info['l'] - 2 * wt)
         inner_w = max(0, self.pack_info['w'] - 2 * wt)
         
-        module_positions = self.opt.pack_modules_in_pack(
+        # 모듈 회전 적용
+        place_mod_l = self.mod_w.value() if self.pack_module_rotated else self.mod_l.value()
+        place_mod_w = self.mod_l.value() if self.pack_module_rotated else self.mod_w.value()
+        
+        # 정렬 값 가져오기
+        pack_ax = self.pack_align_x_group.checkedButton()
+        pack_ay = self.pack_align_y_group.checkedButton()
+        align_x = pack_ax.property("align_val") if pack_ax else "Center"
+        align_y = pack_ay.property("align_val") if pack_ay else "Center"
+        
+        module_positions = self.pack_engine.pack_modules_in_pack(
             inner_l, inner_w, 
-            self.mod_l.value(), self.mod_w.value(), self.mod_clearance.value()
+            place_mod_l, place_mod_w, self.mod_clearance.value(),
+            align_x=align_x, align_y=align_y
         )
         
-        self.final_result = self.cad.create_full_pack(
+        self.final_result = self.pack_engine.create_full_pack(
             self.optimized_module_data, 
             module_positions, 
             offset=offset, 
             wall_thickness=wt,
-            bottom_thickness=bt
+            bottom_thickness=bt,
+            module_rotated=self.pack_module_rotated,
+            pack_dims=(self.pack_info['l'], self.pack_info['w'], self.pack_info['h'])
         )
         
         # 결과 시각화 (오른쪽 뷰어)
@@ -1100,10 +1236,79 @@ class EcoPackApp(QMainWindow):
         self.pack_plotter.reset_camera()
         self.export_btn.setEnabled(True)
 
+    def rotate_pack_module(self):
+        """팩 내 모듈 배치 방향을 90도 회전 토글합니다."""
+        self.pack_module_rotated = not self.pack_module_rotated
+        if self.pack_module_rotated:
+            self.btn_rotate_module.setText("Rotate Module 90° (ON)")
+            self.btn_rotate_module.setStyleSheet("background-color: #007AFF; color: white;")
+        else:
+            self.btn_rotate_module.setText("Rotate Module 90°")
+            self.btn_rotate_module.setStyleSheet("")
+        
+        # 최적화 결과가 있으면 즉시 재배치
+        if self.final_result:
+            self.optimize_pack()
+
+    def analyze_inner_volume(self):
+        """전문 엔진을 사용하여 내부 공간(볼륨)만 분석합니다. 메시 생성 없이 빠르게 수행."""
+        if not self.pack_info:
+            QMessageBox.warning(self, "Warning", "Please load a Pack STEP file first.")
+            return
+            
+        try:
+            wt = self.pack_wall_t.value()
+            result = self.pack_engine.mesh_engine.apply_thickness(wt)
+            
+            # mm³ → m³ 변환 (÷ 1e9)
+            inner_m3 = result['inner_volume_mm3'] / 1e9
+            wall_m3 = result['wall_volume_mm3'] / 1e9
+            
+            self.mesh_stats_label.setText(
+                f"Inner: {inner_m3:,.6f} m³ | "
+                f"Wall: {wall_m3:,.6f} m³ | "
+                f"{result['utilization_pct']}%"
+            )
+            self.btn_gen_mesh.setEnabled(True)
+                
+            QMessageBox.information(self, "Analysis Complete", 
+                                f"Inner Volume: {inner_m3:,.6f} m³\n"
+                                f"Wall Volume: {wall_m3:,.6f} m³\n"
+                                f"Utilization: {result['utilization_pct']}%")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Analysis failed: {str(e)}")
+
+    def generate_tetra_mesh(self):
+        """내부 공간에 대해 테트라헤드럴 메시를 생성합니다."""
+        try:
+            self.btn_gen_mesh.setText("Generating...")
+            self.btn_gen_mesh.setEnabled(False)
+            QApplication.processEvents()
+            
+            stats = self.pack_engine.mesh_engine.generate_volume_mesh()
+            
+            self.mesh_stats_label.setText(f"Nodes: {stats['n_nodes']:,} | Elements: {stats['n_elements']:,}")
+            
+            # 메시 시각화
+            if self.pack_engine.mesh_engine.volume_mesh:
+                surface = self.pack_engine.mesh_engine.volume_mesh.extract_surface()
+                self.pack_plotter.add_mesh(surface, color="#28A745", opacity=0.8, 
+                                          show_edges=True, edge_color="#1B5E20", 
+                                          name="tetra_mesh", label="Tetra Mesh")
+                self.pack_plotter.render()
+                
+            QMessageBox.information(self, "Meshing Complete", 
+                                f"Generated {stats['n_elements']:,} tetrahedral elements.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Meshing failed: {str(e)}")
+        finally:
+            self.btn_gen_mesh.setText("Generate Tetra Mesh")
+            self.btn_gen_mesh.setEnabled(True)
+
     def add_shape_to_viewer(self, plotter, shape, color, opacity, line_color="#495057"):
         """형상을 뷰어에 추가합니다. 실제 그리드 그리기는 finalize_viewer에서 처리합니다."""
         if not shape: return
-        mesh_file = self.cad.get_mesh_file(shape)
+        mesh_file = self.pack_engine.get_mesh_file(shape)
         if mesh_file and os.path.exists(mesh_file):
             mesh = pv.read(mesh_file)
             plotter.add_mesh(mesh, color=color, opacity=opacity, show_edges=True, edge_color=line_color, line_width=2)
@@ -1121,29 +1326,36 @@ class EcoPackApp(QMainWindow):
         else:
             n_x, n_y, n_z = 5, 5, 5
 
-        plotter.show_grid(
-            color='black',
-            grid=True,
-            location='outer',
-            ticks='both',
-            font_size=10,
-            font_family='arial',
-            use_3d_text=False,
-            xtitle='X [mm]', ytitle='Y [mm]', ztitle='Z [mm]',
-            n_xlabels=n_x,
-            n_ylabels=n_y,
-            n_zlabels=n_z,
-            fmt='%.0f'
-        )
+        try:
+            plotter.show_grid(
+                color='black',
+                grid=True,
+                location='outer',
+                ticks='both',
+                font_size=10,
+                font_family='arial',
+                use_3d_text=False,
+                xtitle='X [mm]', ytitle='Y [mm]', ztitle='Z [mm]',
+                n_xlabels=n_x,
+                n_ylabels=n_y,
+                n_zlabels=n_z,
+                fmt='%.0f'
+            )
+        except Exception:
+            pass  # 바운즈가 없으면 그리드 생략
+        
         # 기본 좌표축 표시 (오른쪽 하단)
-        plotter.add_axes(label_size=(0.05, 0.05), color='black')
+        try:
+            plotter.add_axes(label_size=(0.05, 0.05), color='black')
+        except Exception:
+            pass
         plotter.reset_camera()
 
     def export_result(self):
         if not self.final_result: return
         file_path, _ = QFileDialog.getSaveFileName(self, "Export STEP", "EcoPack_Full_Assembly.step", "STEP (*.step)")
         if file_path:
-            self.cad.export_to_step(self.final_result, file_path)
+            self.pack_engine.export_to_step(self.final_result, file_path)
             QMessageBox.information(self, "Export Success", "Assembly saved successfully!")
 
     def closeEvent(self, event):

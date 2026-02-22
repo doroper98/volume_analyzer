@@ -1,6 +1,70 @@
+import cadquery as cq
 import math
 
-class Optimizer:
+
+class ModuleEngine:
+    """모듈 구성 엔진: 셀 생성, 모듈 하우징 생성, 셀 배치를 담당합니다.
+    팩 엔진과 독립적으로 동작합니다.
+    """
+
+    def __init__(self):
+        self.cq = cq
+
+    # ─── Cell ───────────────────────────────────────────────
+
+    def create_cell(self, cell_type, l, w, h):
+        """개별 셀 형상을 생성합니다."""
+        if "Cylindrical" in cell_type:
+            # l은 지름(Diameter), h는 높이
+            return cq.Workplane("XY").circle(l/2).extrude(h)
+        else:
+            # 角形(Prismatic) 및 Pouch도 바닥이 Z=0에서 시작하게 함
+            return cq.Workplane("XY").rect(l, w).extrude(h)
+
+    # ─── Module Housing ─────────────────────────────────────
+
+    def create_module_housing(self, mod_l, mod_w, mod_h, wall_t, bottom_t, top_t):
+        """벽면, 바닥, 상단 두께가 각각 적용된 하우징 형상을 생성합니다. (0,0,0에서 시작)"""
+        # (0,0,0) 코너 정렬을 위해 중심에서 L/2, W/2, H/2만큼 이동
+        outer_box = cq.Workplane("XY").box(mod_l, mod_w, mod_h).translate((mod_l/2, mod_w/2, mod_h/2))
+        
+        inner_l = mod_l - 2*wall_t
+        inner_w = mod_w - 2*wall_t
+        inner_h = mod_h - bottom_t - top_t
+        
+        # 내부 공간 배치: 하우징 바닥으로부터 bottom_t 오프셋
+        inner_z_center = bottom_t + inner_h / 2.0
+        inner_box = cq.Workplane("XY").box(inner_l, inner_w, inner_h).translate((mod_l/2, mod_w/2, inner_z_center))
+        
+        return outer_box.cut(inner_box)
+
+    # ─── Module Assembly ────────────────────────────────────
+
+    def create_module_assembly(self, mod_l, mod_w, mod_h, wall_t, bottom_t, top_t, cells_positions, cell_spec, vertical_offset=0):
+        """셀이 배치된 모듈 조립체를 생성하며, 개선된 바닥면 기준 정렬을 적용합니다."""
+        module_housing = self.create_module_housing(mod_l, mod_w, mod_h, wall_t, bottom_t, top_t)
+        
+        cell_val_list = []
+        # 하우징 내 바닥면 위치: housing bottom(0) + bottom_t
+        base_z_bottom = bottom_t + vertical_offset
+        
+        for pos in cells_positions:
+            cell = self.create_cell(cell_spec['type'], cell_spec['l'], cell_spec['w'], cell_spec['h'])
+            # Optimizer는 (0,0) 중심 좌표를 주므로, 모듈 중심(L/2, W/2)을 더해줌
+            final_x = pos[0] + mod_l / 2.0
+            final_y = pos[1] + mod_w / 2.0
+            cell = cell.translate((final_x, final_y, base_z_bottom))
+            cell_val_list.append(cell.val())
+            
+        cells_compound = cq.Compound.makeCompound(cell_val_list)
+        
+        return {
+            "housing": module_housing,
+            "cells": cells_compound
+        }
+
+    # ─── Cell Packing Optimizer ─────────────────────────────
+
     @staticmethod
     def pack_cells_in_module(mod_l, mod_w, mod_thickness, cell_type, cell_l, cell_w, cell_gap, wall_gap=0, pattern="Grid (정사각형)", align_x="Center", align_y="Center"):
         """모듈 내부에 셀을 여러 패턴으로 배치할 수 있는 좌표 리스트를 반환합니다."""
@@ -15,7 +79,6 @@ class Optimizer:
             radius = dia / 2
             
             if "Hexagonal-H" in pattern:
-                # 가로 지그재그 (60도)
                 dx = dia
                 dy = dia * math.sqrt(3) / 2
                 rows = int((inner_w - dia) / dy) + 1 if inner_w >= dia else 0
@@ -28,7 +91,6 @@ class Optimizer:
                         positions.append((x_pos, y_pos))
                         
             elif "Hexagonal-V" in pattern:
-                # 세로 지그재그 (60도)
                 dy = dia
                 dx = dia * math.sqrt(3) / 2
                 cols = int((inner_l - dia) / dx) + 1 if inner_l >= dia else 0
@@ -41,7 +103,6 @@ class Optimizer:
                         positions.append((x_pos, y_pos))
 
             elif "Diagonal" in pattern:
-                # 45도 대각 엇갈림 (간격은 dia 유지, 행간격도 dia)
                 dx = dia
                 dy = dia
                 rows = int((inner_w - dia) / dy) + 1 if inner_w >= dia else 0
@@ -54,13 +115,12 @@ class Optimizer:
                         positions.append((x_pos, y_pos))
 
             elif "Staggered" in pattern:
-                # 1/3 오프셋 엇갈림
                 dx = dia
-                dy = dia * 0.9 # 약간 더 조밀하게
+                dy = dia * 0.9
                 rows = int((inner_w - dia) / dy) + 1 if inner_w >= dia else 0
                 for r in range(rows):
                     y_pos = -inner_w/2 + radius + r * dy
-                    off_x = (dia * (r % 3) / 3) # 3행 주기로 엇갈림
+                    off_x = (dia * (r % 3) / 3)
                     cols = int((inner_l - dia - off_x) / dx) + 1 if inner_l >= (dia + off_x) else 0
                     for c in range(cols):
                         x_pos = -inner_l/2 + radius + off_x + c * dx
@@ -104,14 +164,13 @@ class Optimizer:
         if align_x == "Even":
             unique_xs = sorted(list(set(xs)))
             if len(unique_xs) > 1:
-                # 첫 열과 끝 열 사이를 균등 분할
                 new_start_x = -inner_l/2 + cl/2
                 new_end_x = inner_l/2 - cl/2
                 pitch_x = (new_end_x - new_start_x) / (len(unique_xs) - 1)
                 mapping_x = {old: new_start_x + i * pitch_x for i, old in enumerate(unique_xs)}
                 positions = [(mapping_x[p[0]], p[1]) for p in positions]
             else:
-                shift_x = -min_x # 중앙 정렬과 유사
+                shift_x = -min_x
         elif align_x == "Start":
             shift_x = -inner_l/2 + cl/2 - min_x
         elif align_x == "End":
@@ -141,72 +200,3 @@ class Optimizer:
             positions = [(p[0], p[1] + shift_y) for p in positions]
             
         return positions
-
-    @staticmethod
-    def pack_modules_in_pack(pack_l, pack_w, mod_l, mod_w, clearance, align_x="Center", align_y="Center"):
-        """팩 내부에 모듈을 배치할 좌표 리스트를 반환합니다."""
-        pitch_l = mod_l + clearance
-        pitch_w = mod_w + clearance
-        
-        cols = int(pack_l / pitch_l)
-        rows = int(pack_w / pitch_w)
-        
-        positions = []
-        if cols > 0 and rows > 0:
-            start_x = -(cols * pitch_l - clearance) / 2 + mod_l / 2
-            start_y = -(rows * pitch_w - clearance) / 2 + mod_w / 2
-            
-            for r in range(rows):
-                for c in range(cols):
-                    positions.append((start_x + c * pitch_l, start_y + r * pitch_w))
-        
-        if not positions:
-            return []
-        
-        # Alignment
-        xs = [p[0] for p in positions]
-        ys = [p[1] for p in positions]
-        half_l = pack_l / 2
-        half_w = pack_w / 2
-        
-        # X alignment
-        shift_x = 0
-        if align_x == "Even":
-            unique_xs = sorted(set(xs))
-            if len(unique_xs) > 1:
-                new_start = -half_l + mod_l / 2
-                new_end = half_l - mod_l / 2
-                pitch = (new_end - new_start) / (len(unique_xs) - 1)
-                mapping = {old: new_start + i * pitch for i, old in enumerate(unique_xs)}
-                positions = [(mapping[p[0]], p[1]) for p in positions]
-            # 1열이면 Center로 폴백 (아무것도 안 함 = 이미 중앙)
-        elif align_x == "Start":
-            shift_x = -half_l + mod_l / 2 - min(xs)
-        elif align_x == "End":
-            shift_x = half_l - mod_l / 2 - max(xs)
-        
-        if shift_x != 0:
-            positions = [(p[0] + shift_x, p[1]) for p in positions]
-        
-        # Y alignment
-        shift_y = 0
-        ys = [p[1] for p in positions]
-        if align_y == "Even":
-            unique_ys = sorted(set(ys))
-            if len(unique_ys) > 1:
-                new_start = -half_w + mod_w / 2
-                new_end = half_w - mod_w / 2
-                pitch = (new_end - new_start) / (len(unique_ys) - 1)
-                mapping = {old: new_start + i * pitch for i, old in enumerate(unique_ys)}
-                positions = [(p[0], mapping[p[1]]) for p in positions]
-            # 1행이면 Center로 폴백 (아무것도 안 함 = 이미 중앙)
-        elif align_y == "Start":
-            shift_y = -half_w + mod_w / 2 - min(ys)
-        elif align_y == "End":
-            shift_y = half_w - mod_w / 2 - max(ys)
-        
-        if shift_y != 0:
-            positions = [(p[0], p[1] + shift_y) for p in positions]
-        
-        return positions
-

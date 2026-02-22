@@ -1,14 +1,22 @@
 import cadquery as cq
 import os
+import math
 from .volume_mesh_engine import VolumeMeshEngine
 
-class CADEngine:
+
+class PackEngine:
+    """팩 구성 엔진: STEP 파일 로딩, 내부 공간 생성, 모듈 배치, 메시 분석, 내보내기를 담당합니다.
+    모듈 엔진과 독립적으로 동작합니다.
+    """
+
     def __init__(self):
         self.cq = cq
         self.pack_housing = None
         self.available_volume = None
         self.mesh_engine = VolumeMeshEngine()
-        
+
+    # ─── STEP Loading ───────────────────────────────────────
+
     def load_step(self, file_path):
         """STEP 파일을 불러오고 내부 볼륨을 분석합니다."""
         print(f"Attempting to load: {file_path}")
@@ -66,6 +74,8 @@ class CADEngine:
             traceback.print_exc()
             return None
 
+    # ─── Inner Cavity ───────────────────────────────────────
+
     def create_inner_cavity(self, wall_thickness, bottom_thickness=None):
         """팩 하우징의 안쪽 방향으로 두께를 적용한 내부 공간 형상을 생성합니다.
         
@@ -99,7 +109,6 @@ class CADEngine:
                 bb = inner_shape.BoundingBox()
                 diff = bottom_thickness - wall_thickness
                 if diff > 0:
-                    # 아래쪽을 더 잘라내야 함 (bottom이 더 두꺼움)
                     cut_box = cq.Workplane("XY").box(
                         bb.xlen + 20, bb.ylen + 20, diff
                     ).translate((
@@ -109,7 +118,6 @@ class CADEngine:
                     ))
                     result = result.cut(cut_box)
                 elif diff < 0:
-                    # bottom이 더 얇은 경우: 아래쪽을 더 확장 (복잡 - 생략, 근사 처리)
                     pass
             
             return result
@@ -120,53 +128,77 @@ class CADEngine:
             traceback.print_exc()
             return None
 
-    def create_cell(self, cell_type, l, w, h):
-        """개별 셀 형상을 생성합니다."""
-        if "Cylindrical" in cell_type:
-            # l은 지름(Diameter), h는 높이
-            return cq.Workplane("XY").circle(l/2).extrude(h)
-        else:
-            # 角形(Prismatic) 및 Pouch도 바닥이 Z=0에서 시작하게 함
-            return cq.Workplane("XY").rect(l, w).extrude(h)
+    # ─── Module Packing in Pack ─────────────────────────────
 
-    def create_module_housing(self, mod_l, mod_w, mod_h, wall_t, bottom_t, top_t):
-        """벽면, 바닥, 상단 두께가 각각 적용된 하우징 형상을 생성합니다. (0,0,0에서 시작)"""
-        # (0,0,0) 코너 정렬을 위해 중심에서 L/2, W/2, H/2만큼 이동
-        outer_box = cq.Workplane("XY").box(mod_l, mod_w, mod_h).translate((mod_l/2, mod_w/2, mod_h/2))
+    @staticmethod
+    def pack_modules_in_pack(pack_l, pack_w, mod_l, mod_w, clearance, align_x="Center", align_y="Center"):
+        """팩 내부에 모듈을 배치할 좌표 리스트를 반환합니다."""
+        pitch_l = mod_l + clearance
+        pitch_w = mod_w + clearance
         
-        inner_l = mod_l - 2*wall_t
-        inner_w = mod_w - 2*wall_t
-        inner_h = mod_h - bottom_t - top_t
+        cols = int(pack_l / pitch_l)
+        rows = int(pack_w / pitch_w)
         
-        # 내부 공간 배치: 하우징 바닥으로부터 bottom_t 오프셋
-        # 내부 박스의 중심점을 (L/2, W/2, bottom_t + inner_h/2)로 설정
-        inner_z_center = bottom_t + inner_h / 2.0
-        inner_box = cq.Workplane("XY").box(inner_l, inner_w, inner_h).translate((mod_l/2, mod_w/2, inner_z_center))
-        
-        return outer_box.cut(inner_box)
-
-    def create_module_assembly(self, mod_l, mod_w, mod_h, wall_t, bottom_t, top_t, cells_positions, cell_spec, vertical_offset=0):
-        """셀이 배치된 모듈 조립체를 생성하며, 개선된 바닥면 기준 정렬을 적용합니다."""
-        module_housing = self.create_module_housing(mod_l, mod_w, mod_h, wall_t, bottom_t, top_t)
-        
-        cell_val_list = []
-        # 하우징 내 바닥면 위치: housing bottom(0) + bottom_t
-        base_z_bottom = bottom_t + vertical_offset
-        
-        for pos in cells_positions:
-            cell = self.create_cell(cell_spec['type'], cell_spec['l'], cell_spec['w'], cell_spec['h'])
-            # Optimizer는 (0,0) 중심 좌표를 주므로, 모듈 중심(L/2, W/2)을 더해줌
-            final_x = pos[0] + mod_l / 2.0
-            final_y = pos[1] + mod_w / 2.0
-            cell = cell.translate((final_x, final_y, base_z_bottom))
-            cell_val_list.append(cell.val())
+        positions = []
+        if cols > 0 and rows > 0:
+            start_x = -(cols * pitch_l - clearance) / 2 + mod_l / 2
+            start_y = -(rows * pitch_w - clearance) / 2 + mod_w / 2
             
-        cells_compound = cq.Compound.makeCompound(cell_val_list)
+            for r in range(rows):
+                for c in range(cols):
+                    positions.append((start_x + c * pitch_l, start_y + r * pitch_w))
         
-        return {
-            "housing": module_housing,
-            "cells": cells_compound
-        }
+        if not positions:
+            return []
+        
+        # Alignment
+        xs = [p[0] for p in positions]
+        ys = [p[1] for p in positions]
+        half_l = pack_l / 2
+        half_w = pack_w / 2
+        
+        # X alignment
+        shift_x = 0
+        if align_x == "Even":
+            unique_xs = sorted(set(xs))
+            if len(unique_xs) > 1:
+                new_start = -half_l + mod_l / 2
+                new_end = half_l - mod_l / 2
+                pitch = (new_end - new_start) / (len(unique_xs) - 1)
+                mapping = {old: new_start + i * pitch for i, old in enumerate(unique_xs)}
+                positions = [(mapping[p[0]], p[1]) for p in positions]
+            # 1열이면 Center로 폴백 (아무것도 안 함 = 이미 중앙)
+        elif align_x == "Start":
+            shift_x = -half_l + mod_l / 2 - min(xs)
+        elif align_x == "End":
+            shift_x = half_l - mod_l / 2 - max(xs)
+        
+        if shift_x != 0:
+            positions = [(p[0] + shift_x, p[1]) for p in positions]
+        
+        # Y alignment
+        shift_y = 0
+        ys = [p[1] for p in positions]
+        if align_y == "Even":
+            unique_ys = sorted(set(ys))
+            if len(unique_ys) > 1:
+                new_start = -half_w + mod_w / 2
+                new_end = half_w - mod_w / 2
+                pitch = (new_end - new_start) / (len(unique_ys) - 1)
+                mapping = {old: new_start + i * pitch for i, old in enumerate(unique_ys)}
+                positions = [(p[0], mapping[p[1]]) for p in positions]
+            # 1행이면 Center로 폴백 (아무것도 안 함 = 이미 중앙)
+        elif align_y == "Start":
+            shift_y = -half_w + mod_w / 2 - min(ys)
+        elif align_y == "End":
+            shift_y = half_w - mod_w / 2 - max(ys)
+        
+        if shift_y != 0:
+            positions = [(p[0], p[1] + shift_y) for p in positions]
+        
+        return positions
+
+    # ─── Full Pack Assembly ─────────────────────────────────
 
     def create_full_pack(self, module_data, module_positions, offset=(0, 0, 0), wall_thickness=0, bottom_thickness=0, module_rotated=False, pack_dims=None):
         """전체 팩 조립체를 생성하며 모듈이 바닥을 뚫지 않도록 안착시킵니다."""
@@ -176,7 +208,6 @@ class CADEngine:
         # 팩 하우징 확인 및 원점 기준 처리
         shifted_pack = None
         if self.pack_housing:
-            # 이미 load_step에서 zmin=0으로 맞춰졌으므로 그대로 사용
             shifted_pack = self.pack_housing.val()
 
         # 팩 중심점: 반드시 load_step에서 계산한 치수 사용
@@ -199,30 +230,21 @@ class CADEngine:
             
             # 회전 적용: 모듈과 셀을 Z축 기준 90도 회전
             if module_rotated:
-                from OCP.gp import gp_Ax1, gp_Pnt, gp_Dir
-                import math
-                rot_axis = gp_Ax1(gp_Pnt(mod_l/2, mod_w/2, 0), gp_Dir(0, 0, 1))
-                mod_shape = mod_shape.located(cq.Location())  # copy
-                # CadQuery rotate
+                mod_shape = mod_shape.located(cq.Location())
                 mod_shape_wp = cq.Workplane("XY").newObject([cq.Shape(mod_shape)])
                 mod_shape_wp = mod_shape_wp.rotate((mod_l/2, mod_w/2, 0), (mod_l/2, mod_w/2, 1), 90)
                 mod_shape = mod_shape_wp.val()
-                # 회전 후 중심 보정 (L/W 스왑)
-                rot_mod_l = mod_w  # 회전 후 L=원래 W
-                rot_mod_w = mod_l  # 회전 후 W=원래 L
+                rot_mod_l = mod_w
+                rot_mod_w = mod_l
             else:
                 rot_mod_l = mod_l
                 rot_mod_w = mod_w
             
             # Z 위치: 팩 바닥 두께(bottom_thickness) + 사용자 수동 Z 오프셋
-            # 팩 바깥 바닥이 z=0이므로, 내부 바닥은 z=bottom_thickness임
             final_z = bottom_thickness + offset[2]
 
             # 중심점 기반 배치 좌표 (X, Y) 및 안착 좌표 (Z)
-            # pos는 (0,0) 중심 기준 좌표, 모듈은 (0,0,0)~(mod_l,mod_w,mod_h) 범위
-            # 따라서 모듈 중심을 빼서 보정해야 함
             if module_rotated:
-                # 회전 후 바운딩 박스 기준으로 중심 보정
                 rot_bb = mod_shape.BoundingBox()
                 final_pos_vec = cq.Vector(
                     pos[0] + center_x + offset[0] - rot_bb.xmin - rot_mod_l / 2.0,
@@ -260,6 +282,7 @@ class CADEngine:
             "cells": cq.Compound.makeCompound(all_cells) if all_cells else None
         }
 
+    # ─── Export ──────────────────────────────────────────────
 
     def export_to_step(self, components_dict, output_path):
         """구성 요소들을 합쳐서 STEP 파일로 내보냅니다."""
@@ -281,7 +304,6 @@ class CADEngine:
         temp_dir = tempfile.gettempdir()
         temp_file = os.path.join(temp_dir, "ecopack_temp_mesh.stl")
         try:
-            # STL로 내보내어 뷰어에서 읽을 수 있게 함
             cq.exporters.export(shape, temp_file, cq.exporters.ExportTypes.STL)
             return temp_file
         except Exception as e:

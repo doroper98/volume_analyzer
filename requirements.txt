@@ -1,0 +1,5 @@
+cadquery
+PySide6
+pyvista
+pyvistaqt
+tetgen
