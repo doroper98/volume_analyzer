@@ -1122,7 +1122,7 @@ class EcoPackApp(QMainWindow):
         op = self.mod_opacity.value() / 100.0
         self.add_shape_to_viewer(self.module_plotter, self.optimized_module_data["housing"], "#495057", op, line_color="black")
         self.add_shape_to_viewer(self.module_plotter, self.optimized_module_data["cells"], "#007AFF", 1.0)
-        self.module_plotter.reset_camera()
+        self.finalize_viewer(self.module_plotter)
         
         self.btn_opt_pack.setEnabled(True)
         # 결과 수량을 Alignment 섹션 제목에 표시
